@@ -1,0 +1,4 @@
+name=DoomTelemetry
+id=DoomTelemetry
+description=Telemetria do servidor e jogadores para integração com API e bot.
+poster=poster.png
