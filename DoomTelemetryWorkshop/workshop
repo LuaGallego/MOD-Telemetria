@@ -1,1 +1,7 @@
+version=1
+id=3682740446
+title=Telemetria para API
+description=Telemetria do servidor e jogadores para integração com API e bot.
+tags=Build 42
+visibility=public
 
