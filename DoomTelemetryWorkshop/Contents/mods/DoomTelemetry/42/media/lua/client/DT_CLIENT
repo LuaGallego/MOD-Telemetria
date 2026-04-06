@@ -1,1 +1,386 @@
 
+require "DT_Shared"
+
+if isServer() then
+    return
+end
+
+local DT_Client = {}
+
+local dt_client_registered = false
+local dt_initial_send_pending = false
+local dt_initial_send_ticks = 0
+local dt_initial_hook_fired = false
+
+local dt_last_character_name = ""
+local dt_last_zombie_kills = 0
+local dt_last_survivor_kills = 0
+local dt_last_session_start_sent_at = 0
+local dt_last_identity_sent_at = 0
+local dt_last_profile_sent_at = 0
+local dt_last_state_sent_at = 0
+local dt_last_death_sent_at = 0
+local dt_last_initial_queue_at = 0
+local dt_initial_packet_sent = false
+
+local trackedPerks = {
+    "Agility","Aiming","Axe","Blunt","Cooking","Crafting","Doctor","Electricity",
+    "Farming","Fishing","Fitness","Lightfoot","LongBlade","Maintenance","Mechanics",
+    "MetalWelding","Nimble","PlantScavenging","Reloading","SmallBlade","SmallBlunt",
+    "Sneak","Spear","Sprinting","Strength","Tailoring","Trapping","Woodwork"
+}
+
+local function now()
+    return os.time()
+end
+
+local function should_send(lastSentAt, minSeconds)
+    local n = now()
+    return (n - (lastSentAt or 0)) >= (minSeconds or 1), n
+end
+
+function DT_Client.GetPlayer()
+    return getPlayer()
+end
+
+function DT_Client.GetMedicalData(player)
+    local out = {
+        bleeding = false,
+        overall_body_damage = 0
+    }
+
+    if not player then
+        return out
+    end
+
+    local bodyDamage = DT.SafeCall(function()
+        if player.getBodyDamage then
+            return player:getBodyDamage()
+        end
+        return nil
+    end, nil)
+
+    if not bodyDamage then
+        return out
+    end
+
+    out.bleeding = DT.SafeCall(function()
+        if bodyDamage.getNumPartsBleeding then
+            return (bodyDamage:getNumPartsBleeding() or 0) > 0
+        end
+        return false
+    end, false)
+
+    out.overall_body_damage = DT.SafeCall(function()
+        if bodyDamage.getOverallBodyHealth then
+            local health = tonumber(bodyDamage:getOverallBodyHealth()) or 0
+            local dmg = 100 - health
+            if dmg < 0 then dmg = 0 end
+            return tonumber(string.format("%.2f", dmg))
+        end
+        return 0
+    end, 0)
+
+    return out
+end
+
+function DT_Client.BuildBase(player)
+    if not player then return nil end
+
+    return {
+        steam_id = DT.GetPlayerSteamID(player),
+        username = player.getUsername and (player:getUsername() or "") or "",
+        display_name = player.getDisplayName and (player:getDisplayName() or "") or "",
+        character_name = DT.GetCharacterName(player),
+        online_id = player.getOnlineID and player:getOnlineID() or -1,
+        player_id = DT.GetPlayerRuntimeId(player),
+        mod_version = DT.MOD_VERSION,
+        timestamp = os.time()
+    }
+end
+
+function DT_Client.BuildIdentity()
+    local player = DT_Client.GetPlayer()
+    local data = DT_Client.BuildBase(player)
+    if not data then return nil end
+    data.event_type = "player_identity"
+    return data
+end
+
+function DT_Client.BuildProfile()
+    local player = DT_Client.GetPlayer()
+    local data = DT_Client.BuildBase(player)
+    if not data then return nil end
+
+    local vehicleData = DT.GetVehicleData(player)
+    local medicalData = DT_Client.GetMedicalData(player)
+
+    data.event_type = "player_profile"
+    data.is_alive = player.isAlive and player:isAlive() or false
+    data.hours_survived = player.getHoursSurvived and tonumber(string.format("%.2f", player:getHoursSurvived())) or 0
+    data.zombie_kills = player.getZombieKills and player:getZombieKills() or 0
+    data.survivor_kills = player.getSurvivorKills and player:getSurvivorKills() or 0
+    data.profession = DT.GetProfession(player)
+    data.traits = DT.GetTraitsString(player)
+    data.traits_array = DT.GetTraitsArray(player)
+    data.perks = {}
+    data.inventory_weight = DT.GetInventoryWeight(player)
+    data.carry_capacity = DT.GetCarryCapacity(player)
+    data.is_in_vehicle = vehicleData.is_in_vehicle
+    data.is_asleep = DT.GetIsAsleep(player)
+    data.is_outdoors = DT.GetIsOutdoors(player)
+    data.building_name = DT.GetBuildingName(player)
+    data.vehicle_id = vehicleData.vehicle_id
+    data.vehicle_script = vehicleData.vehicle_script
+    data.vehicle_speed = vehicleData.vehicle_speed
+    data.bleeding = medicalData.bleeding
+    data.overall_body_damage = medicalData.overall_body_damage
+
+    for _, perkName in ipairs(trackedPerks) do
+        local perk = Perks[perkName]
+        if perk then
+            data.perks[perkName] = player:getPerkLevel(perk)
+        end
+    end
+
+    local faction = Faction and Faction.getPlayerFaction and Faction.getPlayerFaction(player) or nil
+    if faction then
+        data.faction_name = faction.getName and (faction:getName() or "") or ""
+        data.faction_tag = faction.getTag and (faction:getTag() or "") or ""
+        data.faction_owner = faction.getOwner and (faction:getOwner() or "") or ""
+
+        local members = {}
+        if faction.getPlayers then
+            local players = faction:getPlayers()
+            if players then
+                for i = 0, players:size() - 1 do
+                    table.insert(members, tostring(players:get(i)))
+                end
+            end
+        end
+        data.faction_members = members
+    else
+        data.faction_name = ""
+        data.faction_tag = ""
+        data.faction_owner = ""
+        data.faction_members = {}
+    end
+
+    return data
+end
+
+function DT_Client.BuildState()
+    local player = DT_Client.GetPlayer()
+    local data = DT_Client.BuildBase(player)
+    if not data then return nil end
+
+    local vehicleData = DT.GetVehicleData(player)
+    local medicalData = DT_Client.GetMedicalData(player)
+
+    data.event_type = "player_state"
+    data.x = player.getX and tonumber(string.format("%.1f", player:getX())) or 0
+    data.y = player.getY and tonumber(string.format("%.1f", player:getY())) or 0
+    data.z = player.getZ and tonumber(string.format("%.1f", player:getZ())) or 0
+    data.is_alive = player.isAlive and player:isAlive() or false
+    data.hours_survived = player.getHoursSurvived and tonumber(string.format("%.2f", player:getHoursSurvived())) or 0
+    data.zombie_kills = player.getZombieKills and player:getZombieKills() or 0
+    data.survivor_kills = player.getSurvivorKills and player:getSurvivorKills() or 0
+    data.inventory_weight = DT.GetInventoryWeight(player)
+    data.carry_capacity = DT.GetCarryCapacity(player)
+    data.is_in_vehicle = vehicleData.is_in_vehicle
+    data.is_asleep = DT.GetIsAsleep(player)
+    data.is_outdoors = DT.GetIsOutdoors(player)
+    data.building_name = DT.GetBuildingName(player)
+    data.vehicle_id = vehicleData.vehicle_id
+    data.vehicle_script = vehicleData.vehicle_script
+    data.vehicle_speed = vehicleData.vehicle_speed
+    data.bleeding = medicalData.bleeding
+    data.overall_body_damage = medicalData.overall_body_damage
+
+    return data
+end
+
+function DT_Client.Send(command, payload)
+    local player = DT_Client.GetPlayer()
+    if not player or not payload then return end
+    sendClientCommand(player, DT.MOD_ID, command, payload)
+end
+
+function DT_Client.SendIdentity(force)
+    local ok, n = should_send(dt_last_identity_sent_at, force and 0 or 2)
+    if not ok then return end
+    dt_last_identity_sent_at = n
+    DT_Client.Send("PlayerIdentity", DT_Client.BuildIdentity())
+end
+
+function DT_Client.SendProfile(force)
+    local ok, n = should_send(dt_last_profile_sent_at, force and 0 or 2)
+    if not ok then return end
+    dt_last_profile_sent_at = n
+    DT_Client.Send("PlayerProfile", DT_Client.BuildProfile())
+end
+
+function DT_Client.SendState(force)
+    local ok, n = should_send(dt_last_state_sent_at, force and 0 or 1)
+    if not ok then return end
+    dt_last_state_sent_at = n
+    DT_Client.Send("PlayerState", DT_Client.BuildState())
+end
+
+function DT_Client.SendSessionStart(force)
+    local ok, n = should_send(dt_last_session_start_sent_at, force and 0 or 2)
+    if not ok then return end
+    dt_last_session_start_sent_at = n
+
+    local payload = DT_Client.BuildBase(DT_Client.GetPlayer())
+    if not payload then return end
+    payload.event_type = "player_session_start"
+    payload.reason = "login"
+    DT_Client.Send("PlayerSessionStart", payload)
+end
+
+function DT_Client.SendSessionEnd(reason)
+    local payload = DT_Client.BuildState()
+    if not payload then return end
+    payload.event_type = "player_session_end"
+    payload.reason = tostring(reason or "unknown")
+    payload.timestamp = os.time()
+    DT_Client.Send("PlayerSessionEnd", payload)
+end
+
+function DT_Client.SendDeath()
+    local ok, n = should_send(dt_last_death_sent_at, 2)
+    if not ok then return end
+    dt_last_death_sent_at = n
+
+    local payload = DT_Client.BuildState()
+    if not payload then return end
+
+    payload.event_type = "player_death"
+    payload.timestamp = os.time()
+    DT_Client.Send("PlayerDeath", payload)
+
+    local endPayload = DT_Client.BuildState()
+    if endPayload then
+        endPayload.event_type = "player_session_end"
+        endPayload.reason = "death"
+        endPayload.timestamp = os.time()
+        DT_Client.Send("PlayerSessionEnd", endPayload)
+    end
+end
+
+function DT_Client.SendKillDelta(currentZ, currentS)
+    local base = DT_Client.BuildBase(DT_Client.GetPlayer())
+    if not base then return end
+
+    local dz = currentZ - dt_last_zombie_kills
+    local ds = currentS - dt_last_survivor_kills
+
+    if dz <= 0 and ds <= 0 then
+        return
+    end
+
+    base.event_type = "player_kill_delta"
+    base.zombie_kills_total = currentZ
+    base.survivor_kills_total = currentS
+    base.zombie_kills_delta = dz > 0 and dz or 0
+    base.survivor_kills_delta = ds > 0 and ds or 0
+
+    DT_Client.Send("PlayerKillDelta", base)
+end
+
+function DT_Client.QueueInitialSend()
+    if dt_initial_packet_sent or dt_initial_send_pending then
+        return
+    end
+
+    dt_initial_send_pending = true
+    dt_initial_send_ticks = 0
+end
+
+function DT_Client.OnTickInitialSend()
+    if not dt_initial_send_pending then
+        return
+    end
+
+    if dt_initial_packet_sent then
+        dt_initial_send_pending = false
+        return
+    end
+
+    dt_initial_send_ticks = dt_initial_send_ticks + 1
+    if dt_initial_send_ticks < 30 then
+        return
+    end
+
+    local player = DT_Client.GetPlayer()
+    if not player then
+        return
+    end
+
+    dt_initial_send_pending = false
+    dt_initial_packet_sent = true
+
+    dt_last_character_name = DT.GetCharacterName(player)
+    dt_last_zombie_kills = player.getZombieKills and player:getZombieKills() or 0
+    dt_last_survivor_kills = player.getSurvivorKills and player:getSurvivorKills() or 0
+
+    DT_Client.SendSessionStart(true)
+    DT_Client.SendIdentity(true)
+    DT_Client.SendProfile(true)
+    DT_Client.SendState(true)
+end
+
+function DT_Client.OnPerkLevel()
+    DT_Client.SendProfile(true)
+end
+
+function DT_Client.OnPeriodicState()
+    local player = DT_Client.GetPlayer()
+    if not player then return end
+
+    local currentChar = DT.GetCharacterName(player)
+    local currentZ = player.getZombieKills and player:getZombieKills() or 0
+    local currentS = player.getSurvivorKills and player:getSurvivorKills() or 0
+
+    if currentChar ~= dt_last_character_name then
+        dt_last_character_name = currentChar
+        dt_last_zombie_kills = currentZ
+        dt_last_survivor_kills = currentS
+
+        DT_Client.SendSessionStart(true)
+        DT_Client.SendIdentity(true)
+        DT_Client.SendProfile(true)
+        DT_Client.SendState(true)
+        return
+    end
+
+    DT_Client.SendKillDelta(currentZ, currentS)
+    DT_Client.SendState(false)
+
+    dt_last_zombie_kills = currentZ
+    dt_last_survivor_kills = currentS
+end
+
+function DT_Client.TryRegister()
+    if dt_client_registered then
+        return
+    end
+
+    dt_client_registered = true
+
+    Events.OnTick.Add(DT_Client.OnTickInitialSend)
+    Events.EveryTenMinutes.Add(DT_Client.OnPeriodicState)
+    Events.LevelPerk.Add(DT_Client.OnPerkLevel)
+    Events.OnPlayerDeath.Add(DT_Client.SendDeath)
+end
+
+DT_Client.TryRegister()
+
+Events.OnCreatePlayer.Add(function(playerIndex, playerObj)
+    if dt_initial_packet_sent then
+        return
+    end
+
+    DT_Client.QueueInitialSend()
+end)
